@@ -35,10 +35,6 @@ from openviking.storage.queuefs.embedding_msg import (
 )
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
 from openviking.storage.queuefs.process_result import ProcessResult
-from openviking.storage.queuefs.retry_policy import (
-    MAX_FAILURE_REQUEUE_COUNT,
-    is_queue_retryable,
-)
 from openviking.storage.vector_ids import vector_record_id
 from openviking.storage.viking_vector_index_backend import (
     VIKINGDB_CONTENT_MAX_SIZE,
@@ -824,56 +820,9 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                             request_failed_message = error_msg
                             return ProcessResult.failed(error_msg)
 
-                        if not is_queue_retryable(embed_err):
-                            execute_status = "error"
-                            self._log_embedding_error(logging.ERROR, error_msg, embedding_msg)
-                            self._merge_request_stats(
-                                embedding_msg.telemetry_id,
-                                error_count=1,
-                            )
-                            request_failed_message = error_msg
-                            return ProcessResult.failed(error_msg)
-
-                        self._log_embedding_error(logging.WARNING, error_msg, embedding_msg)
-                        execute_status = "requeued"
-                        if self._vikingdb.has_queue_manager:
-                            if embedding_msg.failure_requeue_count >= MAX_FAILURE_REQUEUE_COUNT:
-                                terminal_error = (
-                                    f"{error_msg} (failure requeue limit reached: "
-                                    f"{MAX_FAILURE_REQUEUE_COUNT})"
-                                )
-                                self._log_embedding_error(
-                                    logging.ERROR, terminal_error, embedding_msg
-                                )
-                                self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
-                                execute_status = "error"
-                                request_failed_message = terminal_error
-                                return ProcessResult.failed(terminal_error)
-                            embedding_msg.failure_requeue_count += 1
-                            try:
-                                await self._reenqueue_embedding_msg(embedding_msg)
-                                self._merge_request_stats(
-                                    embedding_msg.telemetry_id,
-                                    requeue_count=1,
-                                )
-                                get_request_wait_tracker().record_embedding_requeue(
-                                    embedding_msg.telemetry_id
-                                )
-                                logger.info(
-                                    "Re-enqueued embedding message after transient error: %s",
-                                    self._embedding_delivery_log_context(embedding_msg),
-                                )
-                                return ProcessResult.requeued()
-                            except Exception as requeue_err:
-                                logger.error(
-                                    self._embedding_error_msg(
-                                        embedding_msg,
-                                        f"Failed to re-enqueue message: {requeue_err}",
-                                    )
-                                )
-
                         self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
                         execute_status = "error"
+                        self._log_embedding_error(logging.ERROR, error_msg, embedding_msg)
                         request_failed_message = error_msg
                         return ProcessResult.failed(error_msg)
 
