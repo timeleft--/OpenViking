@@ -10,6 +10,7 @@ from uuid import uuid4
 
 import pytest
 
+from openviking.models.model_error import ModelError, ModelErrorKind
 from openviking.pyagfs.exceptions import AGFSNotADirectoryError
 from openviking.service.task_queue_middleware import TaskWorkQueueMiddleware
 from openviking.service.task_work_index import TaskWorkIndex
@@ -219,7 +220,13 @@ async def test_malformed_resources_do_not_pause_following_valid_work(semantic_en
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("error", "trips_breaker"),
-    [(TimeoutError("API timeout"), True), (LockAcquisitionError("tree is locked"), False)],
+    [
+        (
+            ModelError(ModelErrorKind.TRANSIENT_NETWORK_ERROR, "API timeout"),
+            True,
+        ),
+        (LockAcquisitionError("tree is locked"), False),
+    ],
 )
 async def test_retryable_errors_keep_existing_behavior(
     semantic_env, monkeypatch, error, trips_breaker
@@ -254,7 +261,7 @@ async def test_retryable_errors_keep_existing_behavior(
 async def test_semantic_failure_requeue_limit_is_terminal(semantic_env):
     env = semantic_env
     msg = env.message(failure_requeue_count=MAX_FAILURE_REQUEUE_COUNT)
-    error = TimeoutError("API timeout")
+    error = ModelError(ModelErrorKind.TRANSIENT_SERVICE_ERROR, "API timeout")
     env.dag.run.side_effect = error
 
     result = await asyncio.wait_for(env.processor.on_dequeue(msg.to_dict()), timeout=1)
@@ -270,6 +277,22 @@ async def test_semantic_failure_requeue_limit_is_terminal(semantic_env):
         "error_count": 1,
         "errors": [{"message": terminal_error}],
     }
+
+
+@pytest.mark.asyncio
+async def test_semantic_unknown_model_error_fails_without_requeue(semantic_env):
+    env = semantic_env
+    msg = env.message()
+    error = ModelError(ModelErrorKind.UNKNOWN, "unclassified provider error")
+    env.dag.run.side_effect = error
+
+    result = await asyncio.wait_for(env.processor.on_dequeue(msg.to_dict()), timeout=1)
+
+    assert result.outcome is ProcessOutcome.FAILED
+    assert result.error == str(error)
+    env.retry_queue.enqueue.assert_not_awaited()
+    await _assert_request_failed(env, msg, error)
+    env.processor._account_breaker(msg.account_id).check()
 
 
 @pytest.mark.asyncio

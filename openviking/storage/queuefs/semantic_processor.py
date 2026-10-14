@@ -51,7 +51,10 @@ from openviking.storage.errors import LockAcquisitionError
 from openviking.storage.index_action import FieldPatch
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
 from openviking.storage.queuefs.process_result import ProcessResult
-from openviking.storage.queuefs.retry_policy import MAX_FAILURE_REQUEUE_COUNT
+from openviking.storage.queuefs.retry_policy import (
+    MAX_FAILURE_REQUEUE_COUNT,
+    is_queue_retryable,
+)
 from openviking.storage.queuefs.semantic_executor import SemanticTreeExecutor, SemanticTreeStats
 from openviking.storage.queuefs.semantic_lock import SemanticLockScope
 from openviking.storage.queuefs.semantic_msg import SemanticMsg, build_semantic_coalesce_key
@@ -834,8 +837,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 if msg is not None:
                     await self._cleanup_local_artifact(msg)
                 return ProcessResult.failed(str(e))
-            else:
-                # Transient or unknown — re-enqueue for retry
+            elif is_queue_retryable(e):
                 execute_status = "requeued"
                 logger.warning(
                     f"Transient API error processing semantic message, re-enqueueing: {e}",
@@ -852,6 +854,19 @@ class SemanticProcessor(DequeueHandlerBase):
                     if result.error is not None:
                         execute_status = "error"
                     return result
+                return ProcessResult.failed(str(e))
+            else:
+                execute_status = "error"
+                logger.error(
+                    f"Non-retryable error processing semantic message, dropping: {e}",
+                    exc_info=True,
+                )
+                if msg is not None:
+                    self._merge_request_stats(msg.telemetry_id, error_count=1)
+                    get_request_wait_tracker().mark_semantic_failed(
+                        msg.telemetry_id, msg.id, str(e)
+                    )
+                    await self._cleanup_local_artifact(msg)
                 return ProcessResult.failed(str(e))
         finally:
             if msg is not None and execute_started_at is not None:

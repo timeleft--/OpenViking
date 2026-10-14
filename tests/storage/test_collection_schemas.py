@@ -13,6 +13,7 @@ import pytest
 import requests
 
 from openviking.models.embedder.base import DenseEmbedderBase, EmbedResult
+from openviking.models.model_error import ModelError, ModelErrorKind
 from openviking.server.identity import RequestContext, Role, UserIdentifier
 from openviking.service.resource_service import ResourceService
 from openviking.storage.collection_schemas import (
@@ -883,7 +884,10 @@ async def test_embedding_failure_requeue_limit(
 
     class _TransientErrorEmbedder(_DummyEmbedder):
         async def embed_async(self, text: str, is_query: bool = False) -> EmbedResult:
-            raise RuntimeError("500 Internal Server Error")
+            raise ModelError(
+                ModelErrorKind.TRANSIENT_SERVICE_ERROR,
+                "500 Internal Server Error",
+            )
 
     vikingdb = _QueueingVikingDB()
     monkeypatch.setattr(
@@ -929,7 +933,10 @@ async def test_embedding_failure_requeue_stops_after_three_attempts(monkeypatch)
     class _TransientErrorEmbedder(_DummyEmbedder):
         async def embed_async(self, text: str, is_query: bool = False) -> EmbedResult:
             self.calls += 1
-            raise RuntimeError("500 Internal Server Error")
+            raise ModelError(
+                ModelErrorKind.TRANSIENT_SERVICE_ERROR,
+                "500 Internal Server Error",
+            )
 
     embedder = _TransientErrorEmbedder()
     vikingdb = _QueueingVikingDB()
@@ -963,6 +970,37 @@ async def test_embedding_failure_requeue_stops_after_three_attempts(monkeypatch)
     assert embedder.calls == 3
     assert results[-1].error is not None
     assert "failure requeue limit reached" in results[-1].error
+
+
+@pytest.mark.asyncio
+async def test_embedding_unknown_model_error_fails_without_reenqueue(monkeypatch):
+    class _QueueingVikingDB:
+        is_closing = False
+        has_queue_manager = True
+
+        def __init__(self):
+            self.enqueued = []
+
+        async def enqueue_embedding_msg(self, msg):
+            self.enqueued.append(msg)
+
+    class _UnknownErrorEmbedder(_DummyEmbedder):
+        async def embed_async(self, text: str, is_query: bool = False) -> EmbedResult:
+            raise ModelError(ModelErrorKind.UNKNOWN, "unclassified provider error")
+
+    vikingdb = _QueueingVikingDB()
+    monkeypatch.setattr(
+        "openviking_cli.utils.config.get_openviking_config",
+        lambda: _DummyConfig(_UnknownErrorEmbedder()),
+    )
+    handler = TextEmbeddingHandler(vikingdb)
+
+    result = await handler.on_dequeue(_build_queue_payload())
+
+    assert result.outcome is ProcessOutcome.FAILED
+    assert result.error is not None
+    assert "unclassified provider error" in result.error
+    assert vikingdb.enqueued == []
 
 
 @pytest.mark.asyncio
