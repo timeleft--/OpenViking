@@ -97,7 +97,7 @@ class TestFsCp:
 
             # Request-scoped write completion can precede ancestor refreshes.
             # Copy needs a lease on the whole source tree, so settle those first.
-            settled = api_client.system_wait(timeout=30)
+            settled = api_client.system_wait()
             assert settled.status_code == 200, settled.text
 
             copied = api_client.fs_cp(source, target, recursive=True)
