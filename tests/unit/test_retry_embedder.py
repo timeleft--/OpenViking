@@ -236,6 +236,23 @@ def test_failover_runs_after_current_credential_retry_exhaustion():
     assert backup.calls == 1
 
 
+def test_unknown_error_retries_without_expanding_to_credential_failover():
+    errors = [ModelError(ModelErrorKind.UNKNOWN, "unclassified API error") for _ in range(3)]
+    primary = FakeDenseEmbedder(errors, max_retries=2)
+    backup = FakeDenseEmbedder([[0.3, 0.4]], max_retries=2)
+    failover = FailoverEmbedder(
+        [RetryEmbedder(primary), RetryEmbedder(backup)],
+        ["primary", "backup"],
+    )
+
+    with pytest.raises(ModelError) as raised:
+        failover.embed("query")
+
+    assert raised.value is errors[-1]
+    assert primary.calls == 3
+    assert backup.calls == 0
+
+
 def test_account_state_reaches_retry_inner_and_close_is_delegated_once():
     inner = FakeDenseEmbedder([[0.1, 0.2]])
     embedder = RetryEmbedder(inner)

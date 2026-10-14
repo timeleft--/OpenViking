@@ -219,8 +219,8 @@ def _sdk_kind(error: BaseException) -> tuple[ModelErrorKind, str] | None:
             "InternalServerError": ModelErrorKind.TRANSIENT_SERVICE_ERROR,
         }
         kind = (
-            class_kinds.get(name)
-            or _kind_from_code(error)
+            _kind_from_code(error)
+            or class_kinds.get(name)
             or _kind_from_status(_status_code(error))
         )
         return kind or ModelErrorKind.UNKNOWN, provider
@@ -237,8 +237,8 @@ def _sdk_kind(error: BaseException) -> tuple[ModelErrorKind, str] | None:
             "ArkContentFilterFinishReasonError": ModelErrorKind.CONTENT_SAFETY,
         }
         kind = (
-            class_kinds.get(name)
-            or _kind_from_code(error)
+            _kind_from_code(error)
+            or class_kinds.get(name)
             or _kind_from_status(_status_code(error))
         )
         return kind or ModelErrorKind.UNKNOWN, provider
@@ -327,6 +327,16 @@ def model_error_from_exception(error: BaseException) -> ModelError | None:
             code=_error_code(item),
         )
     return None
+
+
+def model_error_kind(error: BaseException) -> ModelErrorKind | None:
+    """Return the structured model kind carried by an exception chain."""
+    for item in _exception_chain(error):
+        kind = getattr(item, "kind", None)
+        if isinstance(kind, ModelErrorKind):
+            return kind
+    converted = model_error_from_exception(error)
+    return converted.kind if converted is not None else None
 
 
 F = TypeVar("F", bound=Callable[..., Any])

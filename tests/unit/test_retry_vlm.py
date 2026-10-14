@@ -4,11 +4,14 @@
 import asyncio
 from pathlib import Path
 
+import httpx
+import openai
 import pytest
 
 from openviking.models.model_error import ModelError, ModelErrorKind
 from openviking.models.vlm.base import MultiCredentialVLM, VLMBase, VLMFactory
 from openviking.models.vlm.retry_vlm import RetryVLM
+from openviking.utils.circuit_breaker import CircuitBreaker
 from openviking.utils.model_retry import model_retry_scope
 from openviking_cli.utils.config.vlm_config import VLMConfig
 
@@ -243,3 +246,119 @@ def test_vlm_config_wraps_each_credential_inside_failover():
         "KimiVLM",
         "GLMVLM",
     ]
+
+
+def _openai_client(handler, *, base_url="https://example.test/v1"):
+    return openai.OpenAI(
+        api_key="test-key",
+        base_url=base_url,
+        max_retries=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+
+def test_vlm_config_fails_over_when_primary_model_is_not_found():
+    calls = {"primary": 0, "backup": 0}
+
+    def primary_handler(request):
+        calls["primary"] += 1
+        assert request.url.host == "primary.example.test"
+        return httpx.Response(
+            404,
+            json={
+                "error": {
+                    "message": "The model does not exist",
+                    "type": "invalid_request_error",
+                    "code": "model_not_found",
+                }
+            },
+        )
+
+    def backup_handler(request):
+        calls["backup"] += 1
+        assert request.url.host == "backup.example.test"
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "backup-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "backup response"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    config = VLMConfig(
+        model="primary-model",
+        max_retries=2,
+        credentials=[
+            {
+                "id": "primary",
+                "provider": "openai",
+                "api_key": "primary-key",
+                "api_base": "https://primary.example.test/v1",
+                "model": "missing-model",
+            },
+            {
+                "id": "backup",
+                "provider": "openai",
+                "api_key": "backup-key",
+                "api_base": "https://backup.example.test/v1",
+                "model": "backup-model",
+            },
+        ],
+    )
+    instance = config.get_vlm_instance()
+    primary = instance._vlm_instances[0].inner
+    backup = instance._vlm_instances[1].inner
+    primary._sync_client = _openai_client(primary_handler, base_url=primary.api_base)
+    backup._sync_client = _openai_client(backup_handler, base_url=backup.api_base)
+
+    assert instance.get_completion(prompt="hello") == "backup response"
+    assert calls == {"primary": 1, "backup": 1}
+    assert instance.active_credential_id == "backup"
+
+
+def test_openai_500_context_length_code_is_terminal_and_does_not_trip_breaker():
+    calls = 0
+
+    def handler(_request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            500,
+            json={
+                "error": {
+                    "message": "Maximum context length exceeded",
+                    "type": "server_error",
+                    "code": "context_length_exceeded",
+                }
+            },
+        )
+
+    config = VLMConfig(
+        model="test-model",
+        provider="openai",
+        api_key="test-key",
+        max_retries=3,
+    )
+    instance = config.get_vlm_instance()
+    instance.inner._sync_client = _openai_client(handler)
+
+    with pytest.raises(ModelError) as raised:
+        instance.get_completion(prompt="too long")
+
+    assert raised.value.kind is ModelErrorKind.INPUT_TOO_LARGE
+    assert calls == 1
+
+    breaker = CircuitBreaker(failure_threshold=1)
+    breaker.record_failure(raised.value)
+    breaker.check()
+    assert breaker._failure_count == 0

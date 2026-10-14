@@ -99,24 +99,24 @@ def test_extract_metric_error_code_uses_safe_fallbacks_only():
     assert extract_metric_error_code(RuntimeError("request_id=not-a-metric-label")) == "unknown"
 
 
-def test_classify_all_credentials_failed_prefers_transient_over_auth():
+def test_all_credentials_failed_prefers_transient_over_auth():
     err = AllCredentialsFailedError(
         [
             (
                 "cred-a",
-                ERROR_CLASS_AUTH,
+                ModelErrorKind.AUTHENTICATION_ERROR,
                 ModelError(ModelErrorKind.AUTHENTICATION_ERROR, "unauthorized"),
                 0,
             ),
             (
                 "cred-b",
-                ERROR_CLASS_TRANSIENT,
+                ModelErrorKind.TRANSIENT_SERVICE_ERROR,
                 ModelError(ModelErrorKind.TRANSIENT_SERVICE_ERROR, "server error"),
                 1,
             ),
         ]
     )
-    assert classify_api_error(err) == ERROR_CLASS_TRANSIENT
+    assert err.kind is ModelErrorKind.TRANSIENT_SERVICE_ERROR
 
 
 def test_retry_sync_retries_transient_error_until_success():
@@ -257,7 +257,6 @@ def test_retry_sync_does_not_retry_quota_exceeded():
 
     assert raised.value.kind is ModelErrorKind.QUOTA_EXHAUSTED
     assert raised.value.__cause__ is sdk_error
-    assert classify_api_error(raised.value) == ERROR_CLASS_QUOTA_EXCEEDED
     assert attempts["count"] == 1
 
 

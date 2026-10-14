@@ -10,6 +10,7 @@ from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from openviking.core.namespace import classify_uri
+from openviking.models.model_error import ModelErrorKind, model_error_kind
 from openviking.observability.context import (
     bind_root_observability_context,
     reset_root_observability_context,
@@ -64,13 +65,8 @@ from openviking.telemetry import (
 )
 from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 from openviking.telemetry.span_models import create_root_span_attributes
-from openviking.utils.circuit_breaker import (
-    CircuitBreaker,
-    CircuitBreakerOpen,
-    classify_api_error,
-)
+from openviking.utils.circuit_breaker import CircuitBreaker, CircuitBreakerOpen
 from openviking.utils.ingest_options import IngestOptions
-from openviking.utils.model_retry import ERROR_CLASS_INPUT_TOO_LARGE, ERROR_CLASS_PERMANENT
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import VikingURI
 from openviking_cli.utils.config import get_openviking_config
@@ -80,6 +76,18 @@ if TYPE_CHECKING:
     from openviking.config.vlm import VLMHandle, VLMResolver
 
 logger = get_logger(__name__)
+
+_PERMANENT_STORAGE_ERRORS = (
+    FileNotFoundError,
+    PermissionError,
+    IsADirectoryError,
+    NotADirectoryError,
+    AGFSNotADirectoryError,
+)
+
+
+def _is_permanent_storage_error(error: BaseException) -> bool:
+    return any(isinstance(item, _PERMANENT_STORAGE_ERRORS) for item in (error, error.__cause__))
 
 
 class RequestQueueStats:
@@ -785,8 +793,8 @@ class SemanticProcessor(DequeueHandlerBase):
                     return result
                 return ProcessResult.failed(str(e))
 
-            error_class = classify_api_error(e)
-            if error_class == ERROR_CLASS_INPUT_TOO_LARGE:
+            kind = model_error_kind(e)
+            if kind is ModelErrorKind.INPUT_TOO_LARGE:
                 execute_status = "error"
                 logger.error(
                     f"Input too large processing semantic message, dropping: {e}",
@@ -800,16 +808,18 @@ class SemanticProcessor(DequeueHandlerBase):
                 if msg is not None:
                     await self._cleanup_local_artifact(msg)
                 return ProcessResult.failed(str(e))
-            elif error_class == ERROR_CLASS_PERMANENT:
+            elif _is_permanent_storage_error(e) or kind in {
+                ModelErrorKind.MODEL_NOT_FOUND,
+                ModelErrorKind.UNSUPPORTED,
+                ModelErrorKind.INVALID_REQUEST,
+                ModelErrorKind.CONTENT_SAFETY,
+            }:
                 execute_status = "error"
                 logger.critical(
                     f"Permanent error processing semantic message, dropping: {e}",
                     exc_info=True,
                 )
-                # A malformed filesystem target does not indicate an API outage.
-                if breaker is not None and not any(
-                    isinstance(exc, AGFSNotADirectoryError) for exc in (e, e.__cause__)
-                ):
+                if breaker is not None and kind is not None:
                     breaker.record_failure(e)
                 if msg is not None:
                     self._merge_request_stats(msg.telemetry_id, error_count=1)
@@ -821,6 +831,8 @@ class SemanticProcessor(DequeueHandlerBase):
                 return ProcessResult.failed(str(e))
             else:
                 execute_status = "error"
+                if breaker is not None and kind is not None:
+                    breaker.record_failure(e)
                 logger.error(
                     f"Error processing semantic message, not re-enqueueing: {e}",
                     exc_info=True,

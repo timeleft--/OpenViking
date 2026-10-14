@@ -910,7 +910,11 @@ async def test_embedding_auth_error_fails_terminally_without_reenqueue(monkeypat
 
     class _AuthErrorEmbedder(_DummyEmbedder):
         async def embed_async(self, text: str, is_query: bool = False) -> EmbedResult:
-            raise RuntimeError("Error code: 401 - {'code': 'AuthenticationError'} Unauthorized")
+            raise ModelError(
+                ModelErrorKind.AUTHENTICATION_ERROR,
+                "Error code: 401 - {'code': 'AuthenticationError'} Unauthorized",
+                status_code=401,
+            )
 
     vikingdb = _QueueingVikingDB()
     monkeypatch.setattr(
@@ -942,9 +946,11 @@ async def test_request_level_400_does_not_trip_account_breaker(monkeypatch, is_q
         async def embed_async(self, text: str, is_query: bool = False) -> EmbedResult:
             if self.calls == 0:
                 self.calls += 1
-                raise RuntimeError(
+                raise ModelError(
+                    ModelErrorKind.INVALID_REQUEST,
                     "Error code: 400 - {'error': {'code': 'InvalidParameter', "
-                    "'message': 'Invalid base64 image url'}}"
+                    "'message': 'Invalid base64 image url'}}",
+                    status_code=400,
                 )
             return self.embed(text, is_query=is_query)
 
@@ -956,7 +962,7 @@ async def test_request_level_400_does_not_trip_account_breaker(monkeypatch, is_q
     handler = TextEmbeddingHandler(SimpleNamespace(is_closing=False, has_queue_manager=True))
     provider = handler._embedding_provider
 
-    with pytest.raises(RuntimeError, match="400"):
+    with pytest.raises(ModelError, match="400"):
         await provider.embed("default", "bad input", is_query=is_query)
 
     (await handler.breaker()).check()  # would raise CircuitBreakerOpen if tripped
@@ -1130,10 +1136,6 @@ async def test_embedding_handler_propagates_account_id_on_error(monkeypatch):
     monkeypatch.setattr(
         "openviking.metrics.datasources.EmbeddingEventDataSource.record_error",
         staticmethod(lambda **kwargs: captured.update(kwargs)),
-    )
-    monkeypatch.setattr(
-        "openviking.storage.collection_schemas.classify_api_error",
-        lambda _err: "unknown",
     )
 
     handler = TextEmbeddingHandler(_DummyVikingDB())

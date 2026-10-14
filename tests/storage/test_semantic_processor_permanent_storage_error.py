@@ -256,10 +256,10 @@ async def test_semantic_model_error_fails_without_requeue(semantic_env):
 
 
 @pytest.mark.asyncio
-async def test_permanent_api_error_still_opens_breaker(semantic_env):
+async def test_invalid_request_does_not_open_breaker(semantic_env):
     env = semantic_env
     msg = env.message()
-    error = RuntimeError("400 invalid model parameter")
+    error = ModelError(ModelErrorKind.INVALID_REQUEST, "400 invalid model parameter")
     env.dag.run.side_effect = error
 
     result = await asyncio.wait_for(env.processor.on_dequeue(msg.to_dict()), timeout=1)
@@ -268,8 +268,9 @@ async def test_permanent_api_error_still_opens_breaker(semantic_env):
     assert result.error == str(error)
     env.retry_queue.enqueue.assert_not_awaited()
     await _assert_request_failed(env, msg, error)
-    with pytest.raises(CircuitBreakerOpen):
-        env.processor._account_breaker(msg.account_id).check()
+    breaker = env.processor._account_breaker(msg.account_id)
+    breaker.check()
+    assert breaker._failure_count == 0
 
 
 @pytest.mark.asyncio

@@ -10,9 +10,12 @@ from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from typing import AsyncIterator, Awaitable, Callable, TypeVar
 
-from openviking.models.model_error import ModelErrorKind, model_error_from_exception
+from openviking.models.model_error import (
+    ModelErrorKind,
+    model_error_from_exception,
+    model_error_kind,
+)
 from openviking.pyagfs.exceptions import AGFSNotADirectoryError
-from openviking.utils.exceptions import AllCredentialsFailedError
 
 logger = logging.getLogger(__name__)
 
@@ -244,36 +247,9 @@ def classify_api_error(error: Exception) -> str:
     - ``quota_exceeded`` is checked before ``transient`` because quota errors
       typically include "429" / "TooManyRequests" which would otherwise match
       the transient category.
-    - an aggregated ``AllCredentialsFailedError`` is classified from its
-      per-credential classes, not its concatenated message.
+    Structured model errors are intentionally handled by their callers using
+    ``ModelErrorKind`` and are not collapsed into this legacy string taxonomy.
     """
-    if isinstance(error, AllCredentialsFailedError):
-        classes = [ec for (_cid, ec, _exc, _idx) in error.errors if ec]
-        if ERROR_CLASS_TRANSIENT in classes:
-            return ERROR_CLASS_TRANSIENT
-        if ERROR_CLASS_QUOTA_EXCEEDED in classes:
-            return ERROR_CLASS_QUOTA_EXCEEDED
-        if classes and all(ec == ERROR_CLASS_AUTH for ec in classes):
-            return ERROR_CLASS_AUTH
-        return ERROR_CLASS_UNKNOWN
-
-    model_error = model_error_from_exception(error)
-    if model_error is not None:
-        return {
-            ModelErrorKind.TRANSIENT_SERVICE_ERROR: ERROR_CLASS_TRANSIENT,
-            ModelErrorKind.TRANSIENT_NETWORK_ERROR: ERROR_CLASS_TRANSIENT,
-            ModelErrorKind.RATE_LIMIT_ERROR: ERROR_CLASS_TRANSIENT,
-            ModelErrorKind.AUTHENTICATION_ERROR: ERROR_CLASS_AUTH,
-            ModelErrorKind.PERMISSION_DENIED: ERROR_CLASS_AUTH,
-            ModelErrorKind.QUOTA_EXHAUSTED: ERROR_CLASS_QUOTA_EXCEEDED,
-            ModelErrorKind.MODEL_NOT_FOUND: ERROR_CLASS_PERMANENT,
-            ModelErrorKind.UNSUPPORTED: ERROR_CLASS_PERMANENT,
-            ModelErrorKind.INVALID_REQUEST: ERROR_CLASS_PERMANENT,
-            ModelErrorKind.INPUT_TOO_LARGE: ERROR_CLASS_INPUT_TOO_LARGE,
-            ModelErrorKind.CONTENT_SAFETY: ERROR_CLASS_CONTENT_SAFETY,
-            ModelErrorKind.UNKNOWN: ERROR_CLASS_UNKNOWN,
-        }[model_error.kind]
-
     for exc in (error, getattr(error, "__cause__", None)):
         if exc is not None and isinstance(exc, _PERMANENT_IO_ERRORS):
             return ERROR_CLASS_PERMANENT
@@ -332,6 +308,14 @@ def classify_api_error(error: Exception) -> str:
 
 def is_retryable_api_error(error: Exception) -> bool:
     """Return True if the error should be retried."""
+    kind = model_error_kind(error)
+    if kind is not None:
+        return kind in {
+            ModelErrorKind.TRANSIENT_SERVICE_ERROR,
+            ModelErrorKind.TRANSIENT_NETWORK_ERROR,
+            ModelErrorKind.RATE_LIMIT_ERROR,
+            ModelErrorKind.UNKNOWN,
+        }
     return classify_api_error(error) == ERROR_CLASS_TRANSIENT
 
 
@@ -556,8 +540,8 @@ async def retry_async(
 class PrimaryBackupSwitcher:
     """Thread-safe primary/backup switcher with automatic failback logic.
 
-    When an error of type ERROR_CLASS_PERMANENT or ERROR_CLASS_QUOTA_EXCEEDED occurs,
-    switches to backup immediately. Then, after either:
+    When a credential- or provider-specific model error occurs, switches to
+    backup immediately. Then, after either:
     - 10 minutes have passed, OR
     - 200 requests have been made to backup
     it will attempt to failback to primary. If failback fails, it switches back
@@ -615,18 +599,29 @@ class PrimaryBackupSwitcher:
     def record_primary_failure(self, error: Exception) -> bool:
         """Record a primary failure. Returns True if should switch to backup.
 
-        Switches to backup immediately for ERROR_CLASS_PERMANENT,
-        ERROR_CLASS_AUTH or ERROR_CLASS_QUOTA_EXCEEDED.
+        Request-specific errors and unknown failures do not switch models.
         """
-        error_class = classify_api_error(error)
-        if error_class in (
-            ERROR_CLASS_PERMANENT,
-            ERROR_CLASS_AUTH,
-            ERROR_CLASS_QUOTA_EXCEEDED,
-        ):
+        kind = model_error_kind(error)
+        should_switch = kind in {
+            ModelErrorKind.TRANSIENT_SERVICE_ERROR,
+            ModelErrorKind.TRANSIENT_NETWORK_ERROR,
+            ModelErrorKind.RATE_LIMIT_ERROR,
+            ModelErrorKind.AUTHENTICATION_ERROR,
+            ModelErrorKind.PERMISSION_DENIED,
+            ModelErrorKind.QUOTA_EXHAUSTED,
+            ModelErrorKind.MODEL_NOT_FOUND,
+        }
+        if kind is None:
+            should_switch = classify_api_error(error) in {
+                ERROR_CLASS_PERMANENT,
+                ERROR_CLASS_AUTH,
+                ERROR_CLASS_QUOTA_EXCEEDED,
+            }
+        if should_switch:
             with self._lock:
                 if not self._using_backup:
-                    logger.warning(f"Primary failed with {error_class}, switching to backup")
+                    label = kind.value if kind is not None else classify_api_error(error)
+                    logger.warning("Primary failed with %s, switching to backup", label)
                     self._using_backup = True
                 # Always reset timer and counter when we fail (whether initial fail or failback fail)
                 self._switch_to_backup_time = time.monotonic()
@@ -650,8 +645,7 @@ class PrimaryBackupSwitcher:
 class OrderedCredentialSwitcher:
     """Thread-safe ordered N-credential switcher with hierarchical failback.
 
-    Supports ordered failover across multiple credentials. When a credential fails
-    with quota_exceeded or permanent error, it advances to the next credential.
+    Supports ordered failover across multiple credentials.
     After failback thresholds are met, it attempts to move back to a higher-priority
     credential (one step at a time, not all the way back to index 0).
 
@@ -672,17 +666,8 @@ class OrderedCredentialSwitcher:
             failback_request_count: Number of requests after which to attempt failback
 
         Note:
-            Failure handling is driven by the error class (see
-            ``classify_api_error``):
-
-            - request-level errors (``permanent`` 400 / ``input_too_large`` /
-              ``content_safety``) fail fast: the same request fails on every
-              credential of the same model, so switching is useless.
-            - credential-level ``auth`` errors (401/403) advance to the next
-              credential in multi-credential mode; the last (or single)
-              credential fails fast.
-            - ``quota_exceeded`` (and ``transient`` once its retries are
-              exhausted) and ``unknown`` advance to the next credential.
+            Request-specific and unknown model errors fail fast. Credential,
+            model-routing, quota, and exhausted transient failures advance.
         """
         if n < 1:
             raise ValueError("Number of credentials must be >= 1")
@@ -746,18 +731,19 @@ class OrderedCredentialSwitcher:
                 self._active_request_count += 1
 
     @staticmethod
-    def is_fail_fast(error_class: str) -> bool:
+    def is_fail_fast(kind: ModelErrorKind | None) -> bool:
         """Whether an error is request-level and must not try other credentials.
 
-        Request-level errors (400 parameter error, input too large, content
-        safety) fail on every credential of the same model, so the caller should
-        re-raise immediately instead of cycling through credentials.
+        Unknown failures remain within the retry layer and never expand into a
+        credential or model failover.
         """
-        return error_class in (
-            ERROR_CLASS_PERMANENT,
-            ERROR_CLASS_INPUT_TOO_LARGE,
-            ERROR_CLASS_CONTENT_SAFETY,
-        )
+        return kind is None or kind in {
+            ModelErrorKind.UNSUPPORTED,
+            ModelErrorKind.INVALID_REQUEST,
+            ModelErrorKind.INPUT_TOO_LARGE,
+            ModelErrorKind.CONTENT_SAFETY,
+            ModelErrorKind.UNKNOWN,
+        }
 
     def commit_success(self, idx: int) -> None:
         """Record that credential ``idx`` successfully served a request.
