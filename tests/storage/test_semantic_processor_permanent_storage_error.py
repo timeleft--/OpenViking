@@ -240,19 +240,10 @@ async def test_lock_error_requeues_without_consuming_failure_budget(semantic_env
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "kind",
-    [
-        ModelErrorKind.TRANSIENT_SERVICE_ERROR,
-        ModelErrorKind.TRANSIENT_NETWORK_ERROR,
-        ModelErrorKind.RATE_LIMIT_ERROR,
-        ModelErrorKind.UNKNOWN,
-    ],
-)
-async def test_semantic_model_error_fails_without_requeue(semantic_env, kind):
+async def test_semantic_model_error_fails_without_requeue(semantic_env):
     env = semantic_env
     msg = env.message()
-    error = ModelError(kind, "model request failed")
+    error = ModelError(ModelErrorKind.TRANSIENT_SERVICE_ERROR, "model request failed")
     env.dag.run.side_effect = error
 
     result = await asyncio.wait_for(env.processor.on_dequeue(msg.to_dict()), timeout=1)

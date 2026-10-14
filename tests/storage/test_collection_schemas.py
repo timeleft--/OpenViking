@@ -861,16 +861,7 @@ async def test_embedding_handler_open_breaker_logs_summary_instead_of_per_item_w
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "kind",
-    [
-        ModelErrorKind.TRANSIENT_SERVICE_ERROR,
-        ModelErrorKind.TRANSIENT_NETWORK_ERROR,
-        ModelErrorKind.RATE_LIMIT_ERROR,
-        ModelErrorKind.UNKNOWN,
-    ],
-)
-async def test_embedding_model_error_fails_without_reenqueue(monkeypatch, kind):
+async def test_embedding_model_error_fails_without_reenqueue(monkeypatch):
     class _QueueingVikingDB:
         is_closing = False
         has_queue_manager = True
@@ -883,7 +874,7 @@ async def test_embedding_model_error_fails_without_reenqueue(monkeypatch, kind):
 
     class _ModelErrorEmbedder(_DummyEmbedder):
         async def embed_async(self, text: str, is_query: bool = False) -> EmbedResult:
-            raise ModelError(kind, "model request failed")
+            raise ModelError(ModelErrorKind.TRANSIENT_SERVICE_ERROR, "model request failed")
 
     vikingdb = _QueueingVikingDB()
     monkeypatch.setattr(

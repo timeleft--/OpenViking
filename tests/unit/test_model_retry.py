@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for shared model retry helpers."""
 
-import asyncio
-
+import httpx
+import openai
 import pytest
 
-from openviking.models.model_error import ModelError, ModelErrorKind
+from openviking.models.model_error import ModelError, ModelErrorKind, model_error_boundary
 from openviking.pyagfs.exceptions import (
     AGFSClientError,
     AGFSConnectionError,
@@ -23,9 +23,7 @@ from openviking.utils.model_retry import (
     ERROR_CLASS_TRANSIENT,
     ERROR_CLASS_UNKNOWN,
     classify_api_error,
-    effective_max_retries,
     extract_metric_error_code,
-    model_retry_scope,
     retry_async,
     retry_sync,
 )
@@ -71,36 +69,6 @@ def test_classify_other_agfs_errors(error, expected, wrapped):
 
 def test_classify_api_error_recognizes_request_burst_too_fast():
     assert classify_api_error(RuntimeError("RequestBurstTooFast")) == ERROR_CLASS_TRANSIENT
-
-
-@pytest.mark.asyncio
-async def test_model_retry_scope_overrides_and_restores_configured_value():
-    assert effective_max_retries(3) == 3
-
-    async with model_retry_scope(0):
-        assert effective_max_retries(3) == 0
-
-    assert effective_max_retries(3) == 3
-
-
-@pytest.mark.asyncio
-async def test_model_retry_scope_is_isolated_between_tasks():
-    scoped_started = asyncio.Event()
-    default_checked = asyncio.Event()
-
-    async def scoped_call():
-        async with model_retry_scope(0):
-            scoped_started.set()
-            await default_checked.wait()
-            return effective_max_retries(3)
-
-    async def default_call():
-        await scoped_started.wait()
-        retries = effective_max_retries(3)
-        default_checked.set()
-        return retries
-
-    assert await asyncio.gather(scoped_call(), default_call()) == [0, 3]
 
 
 class _ProviderError(RuntimeError):
@@ -165,16 +133,19 @@ def test_retry_sync_retries_transient_error_until_success():
 
 
 @pytest.mark.asyncio
-async def test_retry_async_does_not_retry_unknown_error():
+async def test_retry_async_preserves_local_error_without_parsing_message():
     attempts = {"count": 0}
+    error = RuntimeError("HTTP 503 is input data, not an API failure")
 
+    @model_error_boundary
     async def _call():
         attempts["count"] += 1
-        raise RuntimeError("some unexpected validation failure")
+        raise error
 
-    with pytest.raises(RuntimeError):
-        await retry_async(_call, max_retries=3)
+    with pytest.raises(RuntimeError) as raised:
+        await retry_async(_call, max_retries=3, model_errors_only=True)
 
+    assert raised.value is error
     assert attempts["count"] == 1
 
 
@@ -268,16 +239,25 @@ def test_content_safety_takes_precedence_over_400():
 
 
 def test_retry_sync_does_not_retry_quota_exceeded():
-    """Quota-exceeded errors should NOT be retried."""
+    """Structured quota exhaustion takes precedence over the retryable HTTP 429."""
     attempts = {"count": 0}
+    sdk_error = openai.RateLimitError(
+        "rate limited",
+        response=httpx.Response(429, request=httpx.Request("POST", "https://example.test")),
+        body={"error": {"code": "insufficient_quota"}},
+    )
 
+    @model_error_boundary
     def _call():
         attempts["count"] += 1
-        raise RuntimeError("AccountQuotaExceeded")
+        raise sdk_error
 
-    with pytest.raises(RuntimeError, match="AccountQuotaExceeded"):
-        retry_sync(_call, max_retries=5)
+    with pytest.raises(ModelError) as raised:
+        retry_sync(_call, max_retries=5, model_errors_only=True)
 
+    assert raised.value.kind is ModelErrorKind.QUOTA_EXHAUSTED
+    assert raised.value.__cause__ is sdk_error
+    assert classify_api_error(raised.value) == ERROR_CLASS_QUOTA_EXCEEDED
     assert attempts["count"] == 1
 
 

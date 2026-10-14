@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from openviking.models.model_error import ModelError
+from openviking.models.model_error import ModelError, ModelErrorKind
 
 
 def _make_mock_embedding(values):
@@ -226,28 +226,32 @@ class TestGeminiValidation:
 
 class TestGeminiErrorMessages:
     @pytest.mark.parametrize(
-        "code,match",
+        "reason,expected_kind",
         [
-            (401, "Invalid API key"),
-            (403, "Permission denied"),
-            (404, "Model not found"),
-            (429, "Resource exhausted"),
-            (500, "service error"),
+            ("QUOTA_EXCEEDED", ModelErrorKind.QUOTA_EXHAUSTED),
+            ("RATE_LIMIT_EXCEEDED", ModelErrorKind.RATE_LIMIT_ERROR),
+            (None, ModelErrorKind.UNKNOWN),
         ],
     )
     @patch("openviking.models.embedder.gemini_embedders.genai.Client")
-    def test_error_code_hint(self, mock_client, code, match):
-        from google.genai.errors import APIError
+    def test_resource_exhausted_uses_structured_reason(self, mock_client, reason, expected_kind):
+        from google.genai.errors import ClientError
 
         from openviking.models.embedder.gemini_embedders import GeminiDenseEmbedder
 
         mock = mock_client.return_value
-        mock_resp = MagicMock()
-        mock_resp.status_code = code
-        mock.models.embed_content.side_effect = APIError(code, {}, response=mock_resp)
+        error = ClientError(
+            429,
+            {"error": {"details": [] if reason is None else [{"reason": reason}]}},
+        )
+        mock.models.embed_content.side_effect = error
         embedder = GeminiDenseEmbedder("gemini-embedding-2-preview", api_key="k")
-        with pytest.raises(ModelError, match=match):
+        with pytest.raises(ModelError, match="Resource exhausted") as raised:
             embedder.embed("hello")
+
+        assert raised.value.kind is expected_kind
+        assert raised.value.status_code == 429
+        assert raised.value.__cause__.__cause__ is error
 
     @patch("openviking.models.embedder.gemini_embedders.genai.Client")
     def test_error_message_includes_http_code(self, mock_client):

@@ -130,11 +130,11 @@ def test_retry_embedder_does_not_retry_permanent_or_auth_errors(status_code):
     assert inner.calls == 1
 
 
-def test_retry_embedder_uses_max_retries_as_additional_attempts():
-    errors = [ProviderError(503) for _ in range(3)]
+def test_retry_embedder_unknown_api_error_exhausts_configured_budget():
+    errors = [ModelError(ModelErrorKind.UNKNOWN, "unclassified API error") for _ in range(3)]
     inner = FakeDenseEmbedder(errors, max_retries=2)
 
-    with pytest.raises(ProviderError) as raised:
+    with pytest.raises(ModelError) as raised:
         RetryEmbedder(inner).embed("query")
 
     assert raised.value is errors[-1]
@@ -150,8 +150,10 @@ def test_retry_embedder_sparse_dimension_remains_unsupported():
 
 
 @pytest.mark.asyncio
-async def test_retry_releases_semaphore_before_backoff(monkeypatch):
-    inner = FakeDenseEmbedder([ProviderError(503), [0.1, 0.2]], max_retries=1)
+async def test_scoped_failure_restores_retries_and_releases_semaphore(monkeypatch):
+    error = ProviderError(503)
+    inner = FakeDenseEmbedder([error, ProviderError(503), [0.1, 0.2]], max_retries=1)
+    embedder = RetryEmbedder(inner)
     semaphore = AsyncSemaphore(1)
     inner._account_semaphore = semaphore
     observed_values = []
@@ -161,25 +163,20 @@ async def test_retry_releases_semaphore_before_backoff(monkeypatch):
 
     monkeypatch.setattr("openviking.utils.model_retry.asyncio.sleep", observe_backoff)
 
-    result = await RetryEmbedder(inner).embed_async("query")
-
-    assert result.dense_vector == [0.1, 0.2]
-    assert inner.calls == 2
-    assert observed_values == [1]
+    async with model_retry_scope(0):
+        with pytest.raises(ProviderError) as raised:
+            await embedder.embed_async("query")
+    assert raised.value is error
+    assert inner.calls == 1
+    assert observed_values == []
     assert semaphore._value == 1
 
+    result = await embedder.embed_async("query")
 
-@pytest.mark.asyncio
-async def test_retry_embedder_honors_call_scope_without_mutating_instance():
-    inner = FakeDenseEmbedder([ProviderError(503), [0.1, 0.2]], max_retries=2)
-    embedder = RetryEmbedder(inner)
-
-    async with model_retry_scope(0):
-        with pytest.raises(ProviderError):
-            await embedder.embed_async("query")
-
-    assert inner.calls == 1
-    assert embedder.max_retries == 2
+    assert result.dense_vector == [0.1, 0.2]
+    assert inner.calls == 3
+    assert observed_values == [1]
+    assert semaphore._value == 1
 
 
 @pytest.mark.asyncio

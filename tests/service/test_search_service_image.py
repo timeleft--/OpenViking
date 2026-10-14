@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from openviking.server.identity import RequestContext, Role
@@ -9,7 +11,7 @@ from openviking_cli.session.user_id import UserIdentifier
 class FakeVikingFS:
     def __init__(self):
         self.image_url = None
-        self.retry_values = []
+        self.retry_values = {}
 
     async def read_file_bytes(self, uri, ctx=None):
         assert uri == "viking://resources/cat.png"
@@ -17,38 +19,31 @@ class FakeVikingFS:
 
     async def find(self, **kwargs):
         self.image_url = kwargs["image_url"]
-        self.retry_values.append(effective_max_retries(3))
+        await asyncio.sleep(0)  # Keep the search scope active during the concurrent call.
+        self.retry_values["find"] = effective_max_retries(3)
         return {"ok": True}
 
     async def search(self, **kwargs):
-        self.retry_values.append(effective_max_retries(3))
+        self.retry_values["search"] = effective_max_retries(3)
         return {"ok": True}
 
 
 @pytest.mark.asyncio
-async def test_search_service_resolves_viking_image_url_to_data_uri():
+async def test_image_search_resolves_uri_and_isolates_retry_scope():
     fs = FakeVikingFS()
     service = SearchService(fs)
     ctx = RequestContext(user=UserIdentifier("acc", "user"), role=Role.USER)
 
-    result = await service.find(
-        query="",
-        image_url="viking://resources/cat.png",
-        ctx=ctx,
+    result, _ = await asyncio.gather(
+        service.find(query="", image_url="viking://resources/cat.png", ctx=ctx),
+        fs.search(query="concurrent background work"),
     )
 
     assert result == {"ok": True}
     assert fs.image_url.startswith("data:image/png;base64,")
+    assert fs.retry_values == {"find": 0, "search": 3}
 
-
-@pytest.mark.asyncio
-async def test_search_and_find_disable_model_retries_for_the_call():
-    fs = FakeVikingFS()
-    service = SearchService(fs)
-    ctx = RequestContext(user=UserIdentifier("acc", "user"), role=Role.USER)
-
-    await service.find(query="find", ctx=ctx)
     await service.search(query="search", ctx=ctx)
 
-    assert fs.retry_values == [0, 0]
+    assert fs.retry_values == {"find": 0, "search": 0}
     assert effective_max_retries(3) == 3

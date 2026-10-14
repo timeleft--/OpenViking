@@ -103,14 +103,21 @@ def test_retry_vlm_retries_sync_transient_failures(method, expected_method):
         ("get_vision_completion_async", "async_vision"),
     ],
 )
-async def test_retry_vlm_retries_async_transient_failures(method, expected_method):
-    inner = FakeVLM([ProviderError(503), "ok"])
+async def test_retry_vlm_scoped_failure_restores_async_retries(method, expected_method):
+    error = ProviderError(503)
+    inner = FakeVLM([error, ProviderError(503), "ok"])
     vlm = RetryVLM(inner)
+
+    async with model_retry_scope(0):
+        with pytest.raises(ProviderError) as raised:
+            await getattr(vlm, method)(prompt="hello")
+    assert raised.value is error
+    assert len(inner.calls) == 1
 
     result = await getattr(vlm, method)(prompt="hello")
 
     assert result == "ok"
-    assert [name for name, _kwargs in inner.calls] == [expected_method, expected_method]
+    assert [name for name, _kwargs in inner.calls] == [expected_method] * 3
 
 
 @pytest.mark.parametrize("status_code", [400, 401])
@@ -146,19 +153,6 @@ def test_retry_vlm_uses_max_retries_as_additional_attempts():
 
     assert raised.value is errors[-1]
     assert len(inner.calls) == 3
-
-
-@pytest.mark.asyncio
-async def test_retry_vlm_honors_call_scope_without_mutating_instance():
-    inner = FakeVLM([ProviderError(503), "unexpected"])
-    vlm = RetryVLM(inner)
-
-    async with model_retry_scope(0):
-        with pytest.raises(ProviderError):
-            await vlm.get_completion_async(prompt="hello")
-
-    assert len(inner.calls) == 1
-    assert vlm.max_retries == 2
 
 
 @pytest.mark.asyncio
