@@ -17,6 +17,7 @@ from openviking.models.embedder.base import (
 from openviking.models.embedder.retry_embedder import RetryEmbedder
 from openviking.models.model_error import ModelError, ModelErrorKind
 from openviking.models.vlm.token_usage import TokenUsageTracker
+from openviking.utils.model_retry import model_retry_scope
 from openviking_cli.utils.config.embedding_config import (
     EmbeddingConfig,
     EmbeddingCredential,
@@ -166,6 +167,19 @@ async def test_retry_releases_semaphore_before_backoff(monkeypatch):
     assert inner.calls == 2
     assert observed_values == [1]
     assert semaphore._value == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_embedder_honors_call_scope_without_mutating_instance():
+    inner = FakeDenseEmbedder([ProviderError(503), [0.1, 0.2]], max_retries=2)
+    embedder = RetryEmbedder(inner)
+
+    async with model_retry_scope(0):
+        with pytest.raises(ProviderError):
+            await embedder.embed_async("query")
+
+    assert inner.calls == 1
+    assert embedder.max_retries == 2
 
 
 @pytest.mark.asyncio

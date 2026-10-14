@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for shared model retry helpers."""
 
+import asyncio
+
 import pytest
 
 from openviking.models.model_error import ModelError, ModelErrorKind
@@ -21,7 +23,9 @@ from openviking.utils.model_retry import (
     ERROR_CLASS_TRANSIENT,
     ERROR_CLASS_UNKNOWN,
     classify_api_error,
+    effective_max_retries,
     extract_metric_error_code,
+    model_retry_scope,
     retry_async,
     retry_sync,
 )
@@ -67,6 +71,36 @@ def test_classify_other_agfs_errors(error, expected, wrapped):
 
 def test_classify_api_error_recognizes_request_burst_too_fast():
     assert classify_api_error(RuntimeError("RequestBurstTooFast")) == ERROR_CLASS_TRANSIENT
+
+
+@pytest.mark.asyncio
+async def test_model_retry_scope_overrides_and_restores_configured_value():
+    assert effective_max_retries(3) == 3
+
+    async with model_retry_scope(0):
+        assert effective_max_retries(3) == 0
+
+    assert effective_max_retries(3) == 3
+
+
+@pytest.mark.asyncio
+async def test_model_retry_scope_is_isolated_between_tasks():
+    scoped_started = asyncio.Event()
+    default_checked = asyncio.Event()
+
+    async def scoped_call():
+        async with model_retry_scope(0):
+            scoped_started.set()
+            await default_checked.wait()
+            return effective_max_retries(3)
+
+    async def default_call():
+        await scoped_started.wait()
+        retries = effective_max_retries(3)
+        default_checked.set()
+        return retries
+
+    assert await asyncio.gather(scoped_call(), default_call()) == [0, 3]
 
 
 class _ProviderError(RuntimeError):

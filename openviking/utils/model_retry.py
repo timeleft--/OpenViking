@@ -6,7 +6,9 @@ import random
 import re
 import threading
 import time
-from typing import Awaitable, Callable, TypeVar
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from typing import AsyncIterator, Awaitable, Callable, TypeVar
 
 from openviking.models.model_error import ModelErrorKind, model_error_from_exception
 from openviking.pyagfs.exceptions import AGFSNotADirectoryError
@@ -15,6 +17,30 @@ from openviking.utils.exceptions import AllCredentialsFailedError
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+_max_retries_override: ContextVar[int | None] = ContextVar(
+    "model_max_retries_override",
+    default=None,
+)
+
+
+@asynccontextmanager
+async def model_retry_scope(max_retries: int) -> AsyncIterator[None]:
+    """Temporarily override model retries for the current async context."""
+    if max_retries < 0:
+        raise ValueError("max_retries must be non-negative")
+    token = _max_retries_override.set(max_retries)
+    try:
+        yield
+    finally:
+        _max_retries_override.reset(token)
+
+
+def effective_max_retries(configured_max_retries: int) -> int:
+    """Return the request override when set, otherwise the configured value."""
+    override = _max_retries_override.get()
+    return configured_max_retries if override is None else override
+
 
 # Error classification categories returned by classify_api_error()
 ERROR_CLASS_PERMANENT = "permanent"  # request-level 4xx (e.g. 400 invalid parameter)

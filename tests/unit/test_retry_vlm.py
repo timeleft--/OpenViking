@@ -9,6 +9,7 @@ import pytest
 from openviking.models.model_error import ModelError, ModelErrorKind
 from openviking.models.vlm.base import MultiCredentialVLM, VLMBase, VLMFactory
 from openviking.models.vlm.retry_vlm import RetryVLM
+from openviking.utils.model_retry import model_retry_scope
 from openviking_cli.utils.config.vlm_config import VLMConfig
 
 
@@ -145,6 +146,19 @@ def test_retry_vlm_uses_max_retries_as_additional_attempts():
 
     assert raised.value is errors[-1]
     assert len(inner.calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_retry_vlm_honors_call_scope_without_mutating_instance():
+    inner = FakeVLM([ProviderError(503), "unexpected"])
+    vlm = RetryVLM(inner)
+
+    async with model_retry_scope(0):
+        with pytest.raises(ProviderError):
+            await vlm.get_completion_async(prompt="hello")
+
+    assert len(inner.calls) == 1
+    assert vlm.max_retries == 2
 
 
 @pytest.mark.asyncio
