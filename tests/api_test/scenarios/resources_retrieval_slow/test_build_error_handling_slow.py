@@ -379,10 +379,11 @@ class TestBuildErrorHandlingSlow:
 
         try:
             response = api_client.add_resource(path=zip_path, wait=True)
-            assert response.status_code == 500
+            assert response.status_code == 400
 
             data = response.json()
             if data.get("status") == "error":
+                assert data.get("error", {}).get("code") == "INVALID_ARGUMENT"
                 error_msg = _extract_error_message(data).lower()
                 assert (
                     "zip" in error_msg
