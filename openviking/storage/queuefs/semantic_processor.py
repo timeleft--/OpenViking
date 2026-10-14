@@ -35,7 +35,6 @@ from openviking.parse.parsers.media.utils import (
 from openviking.prompts import render_prompt
 from openviking.pyagfs.exceptions import AGFSNotADirectoryError
 from openviking.server.identity import RequestContext, Role
-from openviking.service.task_processing_time import pause_task_processing
 from openviking.service.task_tracker_concurrency import run_to_completion
 from openviking.service.task_work_index import detach_task_context
 from openviking.storage.abstract_overview import (
@@ -282,8 +281,7 @@ class SemanticProcessor(DequeueHandlerBase):
         # Throttle to prevent re-enqueue storm during OPEN window
         wait = self._account_breaker(msg.account_id).retry_after
         if wait > 0:
-            with pause_task_processing():
-                await asyncio.sleep(wait)
+            await asyncio.sleep(wait)
 
         queue_manager = get_queue_manager()
         if queue_manager is not None:
@@ -556,7 +554,11 @@ class SemanticProcessor(DequeueHandlerBase):
                             get_request_wait_tracker().mark_semantic_done(msg.telemetry_id, msg.id)
                         return ProcessResult.success()
 
-                    if self._vlm_resolver is None:
+                    if (
+                        not msg.wait_for_embeddings_only
+                        and not msg.wait_for_request_completion
+                        and self._vlm_resolver is None
+                    ):
                         raise RuntimeError(
                             "SemanticProcessor requires a VLM resolver for account-owned work"
                         )
@@ -565,10 +567,27 @@ class SemanticProcessor(DequeueHandlerBase):
                         return ProcessResult.success()
                     semantic_lock = work.scope
                     assert semantic_lock is not None
+                    if (
+                        msg.wait_for_request_completion
+                        and not get_request_wait_tracker().is_complete_except(
+                            msg.telemetry_id, msg.id
+                        )
+                    ):
+                        # Keep a single-worker semantic queue moving while this
+                        # coordinator retains the producer's lease.
+                        await asyncio.sleep(0.05)
+                        await work.reenqueue()
+                        execute_status = "requeued"
+                        return ProcessResult.requeued()
                     dag_stats = None
                     processing_succeeded = False
                     try:
-                        if msg.plan is not None:
+                        if msg.wait_for_embeddings_only or msg.wait_for_request_completion:
+                            # SemanticMessageWork drains embeddings for the single-write
+                            # coordinator; the batch coordinator reaches this point only
+                            # after every sibling root has settled.
+                            pass
+                        elif msg.plan is not None:
                             if msg.uri.rstrip("/") != msg.plan.root_uri:
                                 raise ValueError("semantic message URI must match plan root_uri")
                             if msg.context_type != msg.plan.context_type:
@@ -692,7 +711,12 @@ class SemanticProcessor(DequeueHandlerBase):
                                 incremental_update=is_incremental,
                                 target_uri=target_uri,
                                 recursive=msg.recursive,
-                                lock=semantic_lock.lock,
+                                lock=(
+                                    None
+                                    if msg.generation_trigger == "content_write"
+                                    and msg.lock_handoff is not None
+                                    else semantic_lock.lock
+                                ),
                                 is_code_repo=msg.is_code_repo,
                                 changes=changes,
                                 skip_vectorization=msg.skip_vectorization,
@@ -706,6 +730,8 @@ class SemanticProcessor(DequeueHandlerBase):
                                 file_md5s=msg.file_md5s,
                                 artifact_files=msg.artifact_files,
                                 file_abstracts=msg.file_abstracts,
+                                file_vector_actions=msg.file_vector_actions,
+                                file_ingest_options=msg.file_ingest_options,
                                 telemetry_id=msg.telemetry_id,
                             )
                             await executor.run(run_uri)
@@ -734,8 +760,14 @@ class SemanticProcessor(DequeueHandlerBase):
                     failure = work.failure_result(dag_stats)
                     if failure is not None:
                         return failure
-                    get_request_wait_tracker().mark_semantic_done(msg.telemetry_id, msg.id)
-                    self._merge_request_stats(msg.telemetry_id, processed=1)
+                    is_request_coordinator = msg.wait_for_request_completion
+                    get_request_wait_tracker().mark_semantic_done(
+                        msg.telemetry_id,
+                        msg.id,
+                        processed_delta=0 if is_request_coordinator else 1,
+                    )
+                    if not is_request_coordinator:
+                        self._merge_request_stats(msg.telemetry_id, processed=1)
                     logger.info(f"Completed semantic generation for: {msg.uri}")
                     breaker.record_success()
                     await self._cleanup_local_artifact(msg)
